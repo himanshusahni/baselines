@@ -21,7 +21,7 @@ class Model(object):
 
     def __init__(self, policy, ob_space, ac_space, noptions, nenvs, nsteps,
             ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, lr=7e-4,
-            alpha=0.99, epsilon=1e-5, total_timesteps=int(80e6), lrschedule='linear'):
+            alpha=0.99, epsilon=1e-5, deliberation_cost=0.01, total_timesteps=int(80e6), lrschedule='linear'):
 
         sess = tf_util.make_session()
         nact = ac_space.n
@@ -59,12 +59,12 @@ class Model(object):
         # Intra-option policy gradient loss.
         pg_loss = tf.reduce_mean(Q_U * neglogpac)
         # Intra-option termination gradient loss.
-        tg_loss = tf.reduce_mean(A_OHM * logpterm)
+        tg_loss = tf.reduce_mean((A_OHM = deliberation_cost) * logpterm)
 
-        # entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
+        entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
         # loss = pg_loss - entropy*ent_coef
 
-        loss = pg_loss + tg_loss
+        loss = pg_loss + tg_loss - entropy*ent_coef
 
         params = find_trainable_variables("model")
         grads = tf.gradients(loss, params)
