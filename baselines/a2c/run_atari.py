@@ -4,7 +4,7 @@ from baselines import logger
 from baselines.common.cmd_util import make_atari_env, atari_arg_parser
 from baselines.common.vec_env.vec_frame_stack import VecFrameStack
 from baselines.a2c.a2c import learn
-from baselines.ppo2.policies import CnnPolicy, LstmPolicy, LnLstmPolicy
+from baselines.a2c.policies import CnnPolicy, LstmPolicy, LnLstmPolicy
 
 def train(env_id, num_timesteps, seed, policy, lrschedule, num_env):
     if policy == 'cnn':
@@ -14,7 +14,7 @@ def train(env_id, num_timesteps, seed, policy, lrschedule, num_env):
     elif policy == 'lnlstm':
         policy_fn = LnLstmPolicy
     env = VecFrameStack(make_atari_env(env_id, num_env, seed), 4)
-    learn(policy_fn, env, seed, total_timesteps=int(num_timesteps * 1.1), lrschedule=lrschedule)
+    learn(policy_fn, env, seed, noptions=4, total_timesteps=int(num_timesteps * 1.1), lrschedule=lrschedule)
     env.close()
 
 def main():

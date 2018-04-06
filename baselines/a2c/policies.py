@@ -99,35 +99,51 @@ class LstmPolicy(object):
 
 class CnnPolicy(object):
 
-    def __init__(self, sess, ob_space, ac_space, nbatch, nsteps, reuse=False): #pylint: disable=W0613
+    def __init__(self, sess, ob_space, ac_space, noptions, nbatch, nsteps, reuse=False): #pylint: disable=W0613
         nh, nw, nc = ob_space.shape
         ob_shape = (nbatch, nh, nw, nc)
         nact = ac_space.n
         X = tf.placeholder(tf.uint8, ob_shape) #obs
+        opt = tf.placeholder(tf.int32, [nbatch])
         with tf.variable_scope("model", reuse=reuse):
             h = nature_cnn(X)
-            pi = fc(h, 'pi', nact, init_scale=0.01)
-            vf = fc(h, 'v', 1)[:,0]
+            # option values
+            Q = fc(h, 'qopt', noptions, init_scale=0.01)
+            # intra-option policies
+            intra_pi_logits = tf.reshape(fc(h, 'pi', nact*noptions, init_scale=0.01), (nbatch, noptions, nact))
+            # to gather action probabilities only for selected options!
+            gather_indices = tf.range(nbatch) * noptions + opt
+            opt_pi_logits = tf.gather(tf.reshape(intra_pi_logits, (nbatch*noptions, nact)), gather_indices, axis=0)
+            # option termination
+            betas = fc(h, 'b', noptions, init_scale=0.01)
+            beta_logits = tf.gather(tf.reshape(betas, [-1]), gather_indices, axis=0)
 
-        self.pdtype = make_pdtype(ac_space)
-        self.pd = self.pdtype.pdfromflat(pi)
+        # sample an action from the correct option policy
+        opt_pi = tf.nn.softmax(opt_pi_logits)
+        self.apd = tf.distributions.Categorical(probs=opt_pi)
+        a0 = self.apd.sample()
+        neglogp0 = -self.apd.log_prob(a0)
+        # sample termination of options
+        beta = tf.sigmoid(beta_logits)
+        self.bpd = tf.distributions.Categorical(probs=beta)
+        beta0 = self.bpd.sample()
+        neglogpbeta0 = -self.bpd.log_prob(beta0)
 
-        a0 = self.pd.sample()
-        neglogp0 = self.pd.neglogp(a0)
-        self.initial_state = None
+        def step(ob, opt, *_args, **_kwargs):
+            a, opt_done = sess.run([a0, beta0], {X:ob, opt:opt})
+            return a, opt_done
 
-        def step(ob, *_args, **_kwargs):
-            a, v, neglogp = sess.run([a0, vf, neglogp0], {X:ob})
-            return a, v, self.initial_state, neglogp
-
-        def value(ob, *_args, **_kwargs):
-            return sess.run(vf, {X:ob})
+        def Qopt(ob):
+            '''Option values'''
+            Q = sess.run([Q], {X:ob})
 
         self.X = X
-        self.pi = pi
-        self.vf = vf
+        self.opt = opt
+        self.Q = Q
+        self.opt_pi_logits = opt_pi_logits
+        self.beta_logits = beta_logits
         self.step = step
-        self.value = value
+        self.Qopt = Qopt
 
 class MlpPolicy(object):
     def __init__(self, sess, ob_space, ac_space, nbatch, nsteps, reuse=False): #pylint: disable=W0613

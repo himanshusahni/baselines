@@ -19,7 +19,7 @@ from baselines.a2c.utils import cat_entropy, mse
 
 class Model(object):
 
-    def __init__(self, policy, ob_space, ac_space, nenvs, nsteps,
+    def __init__(self, policy, ob_space, ac_space, noptions, nenvs, nsteps,
             ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, lr=7e-4,
             alpha=0.99, epsilon=1e-5, total_timesteps=int(80e6), lrschedule='linear'):
 
@@ -32,14 +32,27 @@ class Model(object):
         R = tf.placeholder(tf.float32, [nbatch])
         LR = tf.placeholder(tf.float32, [])
 
-        step_model = policy(sess, ob_space, ac_space, nenvs, 1, reuse=False)
-        train_model = policy(sess, ob_space, ac_space, nenvs*nsteps, nsteps, reuse=True)
+        step_model = policy(
+            sess,
+            ob_space=ob_space,
+            ac_space=ac_space,
+            noptions=noptions,
+            nbatch=nenvs,
+            nsteps=1,
+            reuse=False)
+        train_model = policy(
+            sess,
+            ob_space=ob_space,
+            ac_space=ac_space,
+            noptions=noptions,
+            nbatch=nenvs*nsteps,
+            nsteps=nsteps,
+            reuse=True)
 
-        neglogpac = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=train_model.pi, labels=A)
+        neglogpac = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=train_model.opt_pi_logits, labels=A)
         pg_loss = tf.reduce_mean(ADV * neglogpac)
-        vf_loss = tf.reduce_mean(mse(tf.squeeze(train_model.vf), R))
-        entropy = tf.reduce_mean(cat_entropy(train_model.pi))
-        loss = pg_loss - entropy*ent_coef + vf_loss * vf_coef
+        entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
+        loss = pg_loss - entropy*ent_coef
 
         params = find_trainable_variables("model")
         grads = tf.gradients(loss, params)
@@ -81,17 +94,17 @@ class Model(object):
         self.train_model = train_model
         self.step_model = step_model
         self.step = step_model.step
-        self.value = step_model.value
-        self.initial_state = step_model.initial_state
         self.save = save
         self.load = load
+        self.sess = sess
         tf.global_variables_initializer().run(session=sess)
 
 class Runner(object):
 
-    def __init__(self, env, model, nsteps=5, gamma=0.99):
+    def __init__(self, env, model, noptions=1, nsteps=5, gamma=0.99):
         self.env = env
         self.model = model
+        self.noptions = noptions
         nh, nw, nc = env.observation_space.shape
         nenv = env.num_envs
         self.batch_ob_shape = (nenv*nsteps, nh, nw, nc)
@@ -102,40 +115,85 @@ class Runner(object):
         self.nsteps = nsteps
         self.states = model.initial_state
         self.dones = [False for _ in range(nenv)]
+        self.opts = [None for _ in range(nenv)]
+        self.opt_dones = [True for _ in range(nenv)]
+        self.opt_eps_start = 1.0
+        self.opt_eps_end = 0.05
+        self.opt_eps_steps = 1000000
+        self.opt_eps = self.opt_eps_start
 
     def run(self):
-        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones = [],[],[],[],[]
+        mb_obs, mb_rewards, mb_options, mb_actions, mb_opt_values, mb_betas, mb_opt_dones, mb_dones = [],[],[],[],[],[],[],[]
         mb_states = self.states
         for n in range(self.nsteps):
-            actions, values, states, _ = self.model.step(self.obs, self.states, self.dones)
+            # get option values
+            Qopt = self.model.Qopt(self.obs)
+            # sample new options if ended last step
+            for n, done in enumerate(self.opts_done):
+                if done:
+                    # pick epsilon greedy
+                    if np.random.uniform() < self.opt_eps:
+                        self.opts[n] = np.random.choice(np.arange(self.noptions))
+                    else:
+                        self.opts[n] = np.random.choice(np.arange(self.noptions), p=Qopt[n])
+            actions, betas, opt_dones = self.model.step(self.obs, self.opts)
             mb_obs.append(np.copy(self.obs))
+            mb_options.append(np.copy(self.opts))
             mb_actions.append(actions)
-            mb_values.append(values)
+            mb_opt_dones.append(opt_dones)
+            mb_betas.append(betas)
             mb_dones.append(self.dones)
+            mb_opt_values.append(Qopt)
             obs, rewards, dones, _ = self.env.step(actions)
             self.states = states
             self.dones = dones
             for n, done in enumerate(dones):
                 if done:
                     self.obs[n] = self.obs[n]*0
+                    self.opts_done[n] = True
             self.obs = obs
             mb_rewards.append(rewards)
+            if self.opt_eps > self.opt_eps_end:
+                self.opt_eps -= (self.opt_eps_start - self.opt_eps_end)/self.opt_eps_steps
         mb_dones.append(self.dones)
         #batch of steps to batch of rollouts
         mb_obs = np.asarray(mb_obs, dtype=np.uint8).swapaxes(1, 0).reshape(self.batch_ob_shape)
         mb_rewards = np.asarray(mb_rewards, dtype=np.float32).swapaxes(1, 0)
+        mb_betas = np.asarray(mb_betas, dtype=np.float32).swapaxes(1, 0)
+        mb_options = np.asarray(mb_options, dtype=np.int32).swapaxes(1, 0)
         mb_actions = np.asarray(mb_actions, dtype=np.int32).swapaxes(1, 0)
-        mb_values = np.asarray(mb_values, dtype=np.float32).swapaxes(1, 0)
+        mb_opt_values = np.asarray(mb_opt_values, dtype=np.float32).swapaxes(1, 0)
+        mb_opt_dones = np.asarray(mb_opt_dones, dtype=np.bool).swapaxes(1, 0)
         mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(1, 0)
         mb_masks = mb_dones[:, :-1]
         mb_dones = mb_dones[:, 1:]
-        last_values = self.model.value(self.obs, self.states, self.dones).tolist()
-        #discount/bootstrap off value fn
-        for n, (rewards, dones, value) in enumerate(zip(mb_rewards, mb_dones, last_values)):
+
+        #discount/bootstrap off option value fn
+        last_values = self.model.Qopt(self.obs).tolist()
+        _, last_betas, _ = self.model.step(self.obs, self.opts)
+        for n, (rewards, dones, betas, options, opt_dones, opt_values, last_value, last_beta) in enumerate(zip(mb_rewards, mb_dones, mb_betas, mb_options, mb_opt_dones, mb_opt_values, last_values, last_betas)):
             rewards = rewards.tolist()
             dones = dones.tolist()
+            betas = betas.tolist()
+            options = options.tolist()
+            discounted = []
+            # last option value is bootstrapped
             if dones[-1] == 0:
-                rewards = discount_with_dones(rewards+[value], dones+[0], self.gamma)[:-1]
+                rewards += [last_value[options[-1]]]
+                dones += [0]
+                betas += [last_beta[options[-1]]]
+                options += [options[-1]]
+                opt_dones += [0]
+            # reverse the option values
+            opt_values = np.flip(opt_values, axes=0)
+            r = 0
+            for reward, done, beta, opt, opt_done, opt_value in zip(rewards[::-1], dones[::-1], betas[::-1], options[::-1], opt_dones[::-1], opt_values):
+                # if option ended on this step, bootstrap Q again
+                if opt_dones:
+                    r = opt_value[opt]
+                r = reward + self.gamma*((1-beta[opt])*r + beta[opt]*np.amax(opt_value))
+
+
             else:
                 rewards = discount_with_dones(rewards, dones, self.gamma)
             mb_rewards[n] = rewards
@@ -145,16 +203,43 @@ class Runner(object):
         mb_masks = mb_masks.flatten()
         return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values
 
-def learn(policy, env, seed, nsteps=5, total_timesteps=int(80e6), vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, lr=7e-4, lrschedule='linear', epsilon=1e-5, alpha=0.99, gamma=0.99, log_interval=100):
+def learn(
+        policy, env, seed, noptions=1, nsteps=5, total_timesteps=int(80e6),
+        vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, lr=7e-4,
+        lrschedule='linear', epsilon=1e-5, alpha=0.99, gamma=0.99,
+        log_interval=100):
     tf.reset_default_graph()
     set_global_seeds(seed)
 
     nenvs = env.num_envs
     ob_space = env.observation_space
     ac_space = env.action_space
-    model = Model(policy=policy, ob_space=ob_space, ac_space=ac_space, nenvs=nenvs, nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
-        max_grad_norm=max_grad_norm, lr=lr, alpha=alpha, epsilon=epsilon, total_timesteps=total_timesteps, lrschedule=lrschedule)
-    runner = Runner(env, model, nsteps=nsteps, gamma=gamma)
+    model = Model(
+        policy=policy,
+        ob_space=ob_space,
+        ac_space=ac_space,
+        noptions=noptions,
+        nenvs=nenvs,
+        nsteps=nsteps,
+        ent_coef=ent_coef,
+        vf_coef=vf_coef,
+        max_grad_norm=max_grad_norm,
+        lr=lr,
+        alpha=alpha,
+        epsilon=epsilon,
+        total_timesteps=total_timesteps,
+        lrschedule=lrschedule)
+    sample_x = np.random.normal(size=(16,84,84,4))
+    opt = np.random.randint(0,4,size=(16,))
+    q = model.sess.run([model.step_model.intra_pi_logits], feed_dict={model.step_model.X:sample_x, model.step_model.opt:opt})
+    print(q)
+    print(q[0].shape)
+
+    exit()
+
+
+
+    runner = Runner(env, model, noptions=noptions, nsteps=nsteps, gamma=gamma)
 
     nbatch = nenvs*nsteps
     tstart = time.time()
