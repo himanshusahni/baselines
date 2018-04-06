@@ -28,11 +28,11 @@ class Model(object):
         nbatch = nenvs*nsteps
 
         A = tf.placeholder(tf.int32, [nbatch])     # Actions
-        Q_U = tf.placeholder(tf.int32, [nbatch])
-        A_OHM = tf.placeholder(tf.int32, [batch])  # Advantages for beta updates
+        Q_U = tf.placeholder(tf.float32, [nbatch])
+        A_OHM = tf.placeholder(tf.float32, [nbatch])  # Advantages for beta updates
         ADV = tf.placeholder(tf.float32, [nbatch]) # Advantages
         R = tf.placeholder(tf.float32, [nbatch])   # Rewards
-        LR = tf.placeholder(tf.float32, [])        # Learning Rates     
+        LR = tf.placeholder(tf.float32, [])        # Learning Rates
 
         step_model = policy(
             sess,
@@ -59,7 +59,7 @@ class Model(object):
         # Intra-option policy gradient loss.
         pg_loss = tf.reduce_mean(Q_U * neglogpac)
         # Intra-option termination gradient loss.
-        tg_loss = tf.reduce_mean(A_OHM * logpterm) 
+        tg_loss = tf.reduce_mean(A_OHM * logpterm)
 
         # entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
         # loss = pg_loss - entropy*ent_coef
