@@ -61,10 +61,10 @@ class Model(object):
         # Intra-option termination gradient loss.
         tg_loss = tf.reduce_mean(A_OHM * logpterm) 
 
-        # entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
+        entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
         # loss = pg_loss - entropy*ent_coef
 
-        loss = pg_loss + tg_loss
+        loss = pg_loss + tg_loss - entropy*ent_coef
 
         params = find_trainable_variables("model")
         grads = tf.gradients(loss, params)
