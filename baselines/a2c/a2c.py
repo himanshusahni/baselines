@@ -27,10 +27,12 @@ class Model(object):
         nact = ac_space.n
         nbatch = nenvs*nsteps
 
-        A = tf.placeholder(tf.int32, [nbatch])
-        ADV = tf.placeholder(tf.float32, [nbatch])
-        R = tf.placeholder(tf.float32, [nbatch])
-        LR = tf.placeholder(tf.float32, [])
+        A = tf.placeholder(tf.int32, [nbatch])     # Actions
+        Q_U = tf.placeholder(tf.int32, [nbatch])
+        A_OHM = tf.placeholder(tf.int32, [batch])  # Advantages for beta updates
+        ADV = tf.placeholder(tf.float32, [nbatch]) # Advantages
+        R = tf.placeholder(tf.float32, [nbatch])   # Rewards
+        LR = tf.placeholder(tf.float32, [])        # Learning Rates     
 
         step_model = policy(
             sess,
@@ -50,15 +52,26 @@ class Model(object):
             reuse=True)
 
         neglogpac = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=train_model.opt_pi_logits, labels=A)
-        pg_loss = tf.reduce_mean(ADV * neglogpac)
-        entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
-        loss = pg_loss - entropy*ent_coef
+        logpterm = tf.sigmoid(train_model.beta_logits)
+
+        # TODO: Need to compute Q_U(s,w,a) and A_OHM(s', w)
+
+        # Intra-option policy gradient loss.
+        pg_loss = tf.reduce_mean(Q_U * neglogpac)
+        # Intra-option termination gradient loss.
+        tg_loss = tf.reduce_mean(A_OHM * logpterm) 
+
+        # entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
+        # loss = pg_loss - entropy*ent_coef
+
+        loss = pg_loss + tg_loss
 
         params = find_trainable_variables("model")
         grads = tf.gradients(loss, params)
         if max_grad_norm is not None:
             grads, grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
         grads = list(zip(grads, params))
+        # TODO: Learning rates for updating the termination weights and intra-option weights may be different.
         trainer = tf.train.RMSPropOptimizer(learning_rate=LR, decay=alpha, epsilon=epsilon)
         _train = trainer.apply_gradients(grads)
 
