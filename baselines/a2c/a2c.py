@@ -59,7 +59,7 @@ class Model(object):
         # Intra-option policy gradient loss.
         pg_loss = tf.reduce_mean(Q_U * neglogpac)
         # Intra-option termination gradient loss.
-        tg_loss = tf.reduce_mean((A_OHM = deliberation_cost) * logpterm) 
+        tg_loss = tf.reduce_mean((A_OHM + deliberation_cost) * logpterm) 
 
         entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
         # loss = pg_loss - entropy*ent_coef
