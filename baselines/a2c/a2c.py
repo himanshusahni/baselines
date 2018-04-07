@@ -27,10 +27,11 @@ class Model(object):
         nact = ac_space.n
         nbatch = nenvs*nsteps
 
-        A = tf.placeholder(tf.int32, [nbatch])     # Actions
-        Q_U = tf.placeholder(tf.float32, [nbatch])
+        A = tf.placeholder(tf.int32, [nbatch])        # Actions
+        Q_U = tf.placeholder(tf.float32, [nbatch]).   # Q_U(s,w,a) values
         A_OHM = tf.placeholder(tf.float32, [nbatch])  # Advantages for beta updates
-        LR = tf.placeholder(tf.float32, [])        # Learning Rates
+        PG_LR = tf.placeholder(tf.float32, [])        # Policy Learning Rates
+        TG_LR = tf.placeholder(tf.float32, [])        # Termination Learning Rates
 
         step_model = policy(
             sess,
@@ -52,42 +53,56 @@ class Model(object):
         neglogpac = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=train_model.opt_pi_logits, labels=A)
         logpterm = tf.sigmoid(train_model.beta_logits)
 
-        # TODO: Need to compute Q_U(s,w,a) and A_OHM(s', w)
-
         # Intra-option policy gradient loss.
-        pg_loss = tf.reduce_mean(Q_U * neglogpac)
+        entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
+        pg_loss = tf.reduce_mean(Q_U * neglogpac) - entropy*ent_coef
         # Intra-option termination gradient loss.
         tg_loss = tf.reduce_mean((A_OHM + deliberation_cost) * logpterm)
-
-        entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
-        # loss = pg_loss - entropy*ent_coef
-
-        loss = pg_loss + tg_loss - entropy*ent_coef
+        q_loss = tf.reduce_mean(mse(tf.squeeze(train_model.Qopt_vals), Q_U))
 
         params = find_trainable_variables("model")
-        grads = tf.gradients(loss, params)
-        if max_grad_norm is not None:
-            grads, grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
-        grads = list(zip(grads, params))
-        # TODO: Learning rates for updating the termination weights and intra-option weights may be different.
-        trainer = tf.train.RMSPropOptimizer(learning_rate=LR, decay=alpha, epsilon=epsilon)
-        _train = trainer.apply_gradients(grads)
+        pg_grads = tf.gradients(pg_loss, params)
+        tg_grads = tf.gradients(tg_loss, params)
+        q_grads = tf.gradients(q_loss, params)
 
-        lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
+        if max_grad_norm is not None:
+            pg_grads, pg_grad_norm = tf.clip_by_global_norm(pg_grads, max_grad_norm)
+            tg_grads, tg_grad_norm = tf.clip_by_global_norm(tg_grads, max_grad_norm)
+            q_grads, q_grad_norm = tf.clip_by_global_norm(q_grads, max_grad_norm)
+
+        pg_grads = list(zip(pg_grads, params))
+        tg_grads = list(zip(tg_grads, params))
+        q_grads = list(zip(q_grads, params))
+
+        pg_trainer = tf.train.RMSPropOptimizer(learning_rate=PG_LR, decay=alpha, epsilon=epsilon)
+        _pg_train = pg_trainer.apply_gradients(pg_grads)
+        
+        tg_trainer = tf.train.RMSPropOptimizer(learning_rate=TG_LR, decay=alpha, epsilon=epsilon)
+        _tg_train = tg_trainer.apply_gradients(tg_grads)
+
+        q_trainer = tf.train.RMSPropOptimizer(learning_rate=Q_LR, decay=alpha, epsilon=epsilon)
+        _q_train = q_trainer.apply_gradients(q_grads)
+
+        # TODO: Learning rates for updating the termination weights, intra-option weights, and q_value weights may be different.
+        pg_lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
+        tg_lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
+        q_lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
 
         def train(obs, options, Qus, Aohms, actions):
             for step in range(len(obs)):
-                cur_lr = lr.value()
-            td_map = {train_model.X:obs, train_model.opt:options, Q_U:Qus, A_OHM:Aohms, A:actions}
+                cur_pg_lr = pg_lr.value()
+                cur_tg_lr = tg_lr.value()
+                cur_q_lr = q_lr.value()
+            td_map = {train_model.X:obs, train_model.opt:options, Q_U:Qus, A_OHM:Aohms, A:actions, PG_LR:cur_pg_lr, TG_LR:cur_tg_lr, Q_LR:cur_q_lr}
             # if states is not None:
                 # td_map[train_model.S] = states
                 # td_map[train_model.M] = masks
             # TODO: Figure out - loss for option policies, beta, q_opt
-            policy_loss, value_loss, policy_entropy, _ = sess.run(
-                [pg_loss, vf_loss, entropy, _train],
+            policy_loss, term_loss, q_value_loss, policy_entropy, _, _, _ = sess.run(
+                [pg_loss, tg_loss, q_loss, entropy, _pg_train, _tg_train, _q_train],
                 td_map
             )
-            return policy_loss, value_loss, policy_entropy
+            return policy_loss, term_loss, q_value_loss, policy_entropy
 
         def save(save_path):
             ps = sess.run(params)
@@ -169,9 +184,13 @@ class Runner(object):
             if self.opt_eps > self.opt_eps_end:
                 self.opt_eps -= (self.opt_eps_start - self.opt_eps_end)/self.opt_eps_steps
         mb_dones.append(self.dones)
-        # mb_options -> (nenvs, nsteps+1) -> w_-1, w_0, w_1, w_2... w_nsteps-1
-        # mb_dones -> (nenvs, nsteps+1) -> d_-1, d_0, d_1, d_2... d_nsteps-1
+
+        # Q-opts -> (nenvs, nsteps+1) -> Q_1, Q_2, ..., Q_nsteps, Q_nsteps+1
+        # betas -> (nenvs, nsteps+1) -> b1, b2, ..., b_nsteps, b_nsteps+1
+        # mb_options -> (nenvs, nsteps+1) -> w_0, w_1, w_2, w_3..., w_nsteps
+        # mb_dones -> (nenvs, nsteps+1) -> d_0, d_1, d_0, d_1, d_2..., d_nsteps
         # batch of steps to batch of rollouts
+
         mb_obs = np.asarray(mb_obs, dtype=np.uint8).swapaxes(1, 0).reshape(self.batch_ob_shape)
         mb_opt_values = np.asarray(mb_opt_values, dtype=np.float32).swapaxes(1, 0)
         mb_options = np.asarray(mb_options, dtype=np.int32).swapaxes(1, 0)
@@ -187,24 +206,27 @@ class Runner(object):
         last_betas = last_betas.tolist()
         mb_Qu = []
         mb_Aohm = []
-        for n, (opt_values, options, betas, dones, rewards, last_value, last_beta) in enumerate(zip(mb_opt_values, mb_options,mb_betas, mb_dones, mb_rewards, last_values, last_betas)):
+        for n, (opt_values, options, betas, dones, rewards, last_value, last_beta) in enumerate(zip(mb_opt_values, mb_options, mb_betas, mb_dones, mb_rewards, last_values, last_betas)):
             rewards = rewards.tolist()
             dones = dones.tolist()
             betas = betas.tolist()
             options = options.tolist()
             # # last option value is bootstrapped
             betas += [last_beta]
-            opt_values = np.concatenate((opt_values, np.expand_dims(last_values, axis=0)), axis=0)
-            # betas -> (nsteps+1,) -> b_0, b_1, .... b_nsteps
-            # opt_values -> (nsteps+1, noptions) -> Q_0, Q_1, .... Q_nsteps
+            opt_values = np.concatenate((opt_values, np.expand_dims(last_value, axis=0)), axis=0)
+            # betas -> (nsteps+1,) -> b1, b2, ..., b_nsteps, b_nsteps+1
+            # opt_values -> (nsteps+1, noptions) -> Q_1, Q_2, ..., Q_nsteps, Q_nsteps+1
+            # dones -> (nsteps+1,) -> d_0, d_1, ..., d_nsteps
+            # options -> (nsteps,) -> w_0, w_1, ..., w_nsteps
             # reverse the option values
             Qu = []
             Aohm = []
             for i in range(self.nsteps, 0, -1):
                 q = rewards[i-1] + (1-dones[i])*self.gamma*((1-betas[i])*opt_values[i,options[i-1]] + betas[i]*np.amax(opt_values[i]))
                 Qu.append(q)
-                a = opt_values[i-1, options[i-1]] - np.amax(opt_values[i-1])
+                a = (1 - dones[i-1]) * (opt_values[i-1, options[i-1]] - np.amax(opt_values[i-1]))
                 Aohm.append(a)
+
             mb_Qu.append(Qu)
             mb_Aohm.append(Aohm)
         mb_options = mb_options.flatten()
@@ -213,7 +235,6 @@ class Runner(object):
         mb_actions = mb_actions.flatten()
         # mb_betas = mb_betas.flatten()
         # mb_masks = mb_masks.flatten()
-        # TODO: comput Aohm
         return mb_obs, mb_options, mb_Qu, mb_Aohm, mb_actions
 
 def learn(
@@ -242,14 +263,6 @@ def learn(
         epsilon=epsilon,
         total_timesteps=total_timesteps,
         lrschedule=lrschedule)
-    sample_x = np.random.normal(size=(16,84,84,4))
-    opt = np.random.randint(0,4,size=(16,))
-    q = model.sess.run([model.step_model.betas, model.step_model.beta_logits], feed_dict={model.step_model.X:sample_x, model.step_model.opt:opt})
-    print(q[0][3])
-    print(q[1][3])
-    print(opt)
-
-    exit()
 
 
 
@@ -259,17 +272,16 @@ def learn(
     tstart = time.time()
     for update in range(1, total_timesteps//nbatch+1):
         obs, options, Qus, Aohms, actions = runner.run()
-        #TODO: match the outputs
-        policy_loss, value_loss, policy_entropy = model.train(obs, options, Qus, Aohms, actions)
+        policy_loss, term_loss, q_value_loss, policy_entropy = model.train(obs, options, Qus, Aohms, actions)
         nseconds = time.time()-tstart
         fps = int((update*nbatch)/nseconds)
         if update % log_interval == 0 or update == 1:
-            ev = explained_variance(values, rewards)
+            # ev = explained_variance(values, rewards)
             logger.record_tabular("nupdates", update)
             logger.record_tabular("total_timesteps", update*nbatch)
             logger.record_tabular("fps", fps)
             logger.record_tabular("policy_entropy", float(policy_entropy))
-            logger.record_tabular("value_loss", float(value_loss))
-            logger.record_tabular("explained_variance", float(ev))
+            logger.record_tabular("q_value_loss", float(q_value_loss))
+            # logger.record_tabular("explained_variance", float(ev))
             logger.dump_tabular()
     env.close()

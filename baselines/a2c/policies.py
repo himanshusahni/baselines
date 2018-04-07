@@ -107,12 +107,17 @@ class CnnPolicy(object):
         opt = tf.placeholder(tf.int32, [nbatch])
         with tf.variable_scope("model", reuse=reuse):
             h = nature_cnn(X)
+
+            # to gather values and action probabilities only for selected options!
+            gather_indices = tf.range(nbatch) * noptions + opt
+
             # option values
             Q = fc(h, 'qopt', noptions, init_scale=0.01)
+            # values of selected options
+            Qopt_vals = tf.gather(tf.reshape(Q, [-1]), gather_indices, axis=0)
             # intra-option policies
             intra_pi_logits = tf.reshape(fc(h, 'pi', nact*noptions, init_scale=0.01), (nbatch, noptions, nact))
-            # to gather action probabilities only for selected options!
-            gather_indices = tf.range(nbatch) * noptions + opt
+            
             opt_pi_logits = tf.gather(tf.reshape(intra_pi_logits, (nbatch*noptions, nact)), gather_indices, axis=0)
             # option termination
             betas = fc(h, 'b', noptions, init_scale=0.01)
