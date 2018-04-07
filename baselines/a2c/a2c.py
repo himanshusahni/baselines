@@ -28,10 +28,11 @@ class Model(object):
         nbatch = nenvs*nsteps
 
         A = tf.placeholder(tf.int32, [nbatch])        # Actions
-        Q_U = tf.placeholder(tf.float32, [nbatch]).   # Q_U(s,w,a) values
+        Q_U = tf.placeholder(tf.float32, [nbatch])    # Q_U(s,w,a) values
         A_OHM = tf.placeholder(tf.float32, [nbatch])  # Advantages for beta updates
         PG_LR = tf.placeholder(tf.float32, [])        # Policy Learning Rates
         TG_LR = tf.placeholder(tf.float32, [])        # Termination Learning Rates
+        Q_LR = tf.placeholder(tf.float32, [])         # Option-value Learning Rates
 
         step_model = policy(
             sess,
@@ -76,7 +77,7 @@ class Model(object):
 
         pg_trainer = tf.train.RMSPropOptimizer(learning_rate=PG_LR, decay=alpha, epsilon=epsilon)
         _pg_train = pg_trainer.apply_gradients(pg_grads)
-        
+
         tg_trainer = tf.train.RMSPropOptimizer(learning_rate=TG_LR, decay=alpha, epsilon=epsilon)
         _tg_train = tg_trainer.apply_gradients(tg_grads)
 
@@ -139,23 +140,26 @@ class Runner(object):
         obs = env.reset()
         self.gamma = gamma
         self.nsteps = nsteps
-        self.states = model.initial_state
+        # self.states = model.initial_state
         self.dones = [True for _ in range(nenv)]
         self.opts = [0 for _ in range(nenv)]
-        self.opt_dones = [True for _ in range(nenv)]
+        self.opt_dones = [1 for _ in range(nenv)]
         self.opt_eps_start = 1.0
         self.opt_eps_end = 0.05
         self.opt_eps_steps = 1000000
         self.opt_eps = self.opt_eps_start
+        self.exit_counter = 0
 
     def run(self):
         mb_obs, mb_opt_values, mb_options, mb_actions, mb_betas, mb_dones, mb_rewards = [],[],[],[],[],[],[]
         mb_options.append(np.copy(self.opts))
+        mb_opt_pi = []
         # mb_states = self.states
         for n in range(self.nsteps):
             # get option values
             Qopt = self.model.step_model.Qopt(self.obs)
             # sample new options if ended last step
+            # print(self.opt_dones)
             for i, opt_done in enumerate(self.opt_dones):
                 if opt_done:
                     # pick epsilon greedy
@@ -164,10 +168,10 @@ class Runner(object):
                     else:
                         self.opts[i] = np.argmax(Qopt[i])
             actions, betas, opt_dones = self.model.step_model.step(self.obs, self.opts)
-            #TODO: update self.opt_dones
             self.opt_dones = opt_dones
             mb_obs.append(np.copy(self.obs))
             mb_opt_values.append(Qopt)
+            mb_opt_pi.append(self.model.sess.run(self.model.step_model.opt_pi, feed_dict={self.model.step_model.X:self.obs, self.model.step_model.opt:self.opts}))
             mb_options.append(np.copy(self.opts))
             mb_actions.append(actions)
             mb_betas.append(betas)
@@ -194,6 +198,7 @@ class Runner(object):
         mb_obs = np.asarray(mb_obs, dtype=np.uint8).swapaxes(1, 0).reshape(self.batch_ob_shape)
         mb_opt_values = np.asarray(mb_opt_values, dtype=np.float32).swapaxes(1, 0)
         mb_options = np.asarray(mb_options, dtype=np.int32).swapaxes(1, 0)
+        mb_opt_pi = np.asarray(mb_opt_pi, dtype=np.float32).swapaxes(1, 0)
         mb_actions = np.asarray(mb_actions, dtype=np.int32).swapaxes(1, 0)
         mb_betas = np.asarray(mb_betas, dtype=np.float32).swapaxes(1, 0)
         mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(1, 0)
@@ -201,7 +206,7 @@ class Runner(object):
         # mb_masks = mb_dones[:, :-1]
 
         # discount/bootstrap off option value fn
-        last_values = self.model.Qopt(self.obs).tolist()
+        last_values = self.model.step_model.Qopt(self.obs).tolist()
         _, last_betas, _ = self.model.step(self.obs, self.opts)
         last_betas = last_betas.tolist()
         mb_Qu = []
@@ -227,9 +232,33 @@ class Runner(object):
                 a = (1 - dones[i-1]) * (opt_values[i-1, options[i-1]] - np.amax(opt_values[i-1]))
                 Aohm.append(a)
 
-            mb_Qu.append(Qu)
-            mb_Aohm.append(Aohm)
-        mb_options = mb_options.flatten()
+            mb_Qu.append(Qu[::-1])
+            mb_Aohm.append(Aohm[::-1])
+        # print("option values")
+        # print(mb_opt_values[0])
+        # print("selected options")
+        # print(mb_options[0])
+        # print("option policies")
+        # print(mb_opt_pi[0])
+        # print("selected actions")
+        # print(mb_actions[0])
+        # print("option betas")
+        # print(mb_betas[0])
+        # print("terminations")
+        # print(mb_dones[0][1:])
+        # print("rewards")
+        # print(mb_rewards[0])
+        # print("option value targets")
+        # print(mb_Qu[0])
+        # print("termination advantage")
+        # print(mb_Aohm[0])
+        # self.exit_counter += 1
+        # if self.exit_counter > 2:
+            # exit()
+
+        mb_Qu = np.asarray(mb_Qu, dtype=np.float32)
+        mb_Aohm = np.asarray(mb_Aohm, dtype=np.float32)
+        mb_options = mb_options[:,1:].flatten()
         mb_Qu = mb_Qu.flatten()
         mb_Aohm = mb_Aohm.flatten()
         mb_actions = mb_actions.flatten()
@@ -263,8 +292,6 @@ def learn(
         epsilon=epsilon,
         total_timesteps=total_timesteps,
         lrschedule=lrschedule)
-
-
 
     runner = Runner(env, model, noptions=noptions, nsteps=nsteps, gamma=gamma)
 

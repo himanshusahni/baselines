@@ -117,7 +117,7 @@ class CnnPolicy(object):
             Qopt_vals = tf.gather(tf.reshape(Q, [-1]), gather_indices, axis=0)
             # intra-option policies
             intra_pi_logits = tf.reshape(fc(h, 'pi', nact*noptions, init_scale=0.01), (nbatch, noptions, nact))
-            
+
             opt_pi_logits = tf.gather(tf.reshape(intra_pi_logits, (nbatch*noptions, nact)), gather_indices, axis=0)
             # option termination
             betas = fc(h, 'b', noptions, init_scale=0.01)
@@ -130,21 +130,22 @@ class CnnPolicy(object):
         neglogp0 = -self.apd.log_prob(a0)
         # sample termination of options
         beta0 = tf.sigmoid(beta_logits)
-        self.bpd = tf.distributions.Categorical(probs=beta0)
+        self.bpd = tf.distributions.Bernoulli(probs=beta0)
         opt_done0 = self.bpd.sample()
-        neglogpbeta0 = -self.bpd.log_prob(opt_done)
+        neglogpbeta0 = -self.bpd.log_prob(opt_done0)
 
-        def step(ob, opt, *_args, **_kwargs):
-            a, beta, opt_done = sess.run([a0, beta0, opt_done0], {X:ob, opt:opt})
+        def step(ob, options, *_args, **_kwargs):
+            a, beta, opt_done = sess.run([a0, beta0, opt_done0], {X:ob, opt:options})
             return a, beta, opt_done
 
         def Qopt(ob):
             '''Option values'''
-            Q = sess.run([Q], {X:ob})
+            return sess.run(Q, {X:ob})
 
         self.X = X
         self.opt = opt
-        self.Q = Q
+        self.Qopt_vals = Qopt_vals
+        self.opt_pi = opt_pi
         self.opt_pi_logits = opt_pi_logits
         self.beta_logits = beta_logits
         self.step = step
