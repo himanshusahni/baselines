@@ -124,14 +124,14 @@ class CnnPolicy(object):
         a0 = self.apd.sample()
         neglogp0 = -self.apd.log_prob(a0)
         # sample termination of options
-        beta = tf.sigmoid(beta_logits)
-        self.bpd = tf.distributions.Categorical(probs=beta)
-        beta0 = self.bpd.sample()
-        neglogpbeta0 = -self.bpd.log_prob(beta0)
+        beta0 = tf.sigmoid(beta_logits)
+        self.bpd = tf.distributions.Categorical(probs=beta0)
+        opt_done0 = self.bpd.sample()
+        neglogpbeta0 = -self.bpd.log_prob(opt_done)
 
         def step(ob, opt, *_args, **_kwargs):
-            a, opt_done = sess.run([a0, beta0], {X:ob, opt:opt})
-            return a, opt_done
+            a, beta, opt_done = sess.run([a0, beta0, opt_done0], {X:ob, opt:opt})
+            return a, beta, opt_done
 
         def Qopt(ob):
             '''Option values'''
