@@ -17,6 +17,10 @@ from baselines.a2c.utils import discount_with_dones
 from baselines.a2c.utils import Scheduler, make_path, find_trainable_variables
 from baselines.a2c.utils import cat_entropy, mse
 
+from datetime import datetime
+from collections import defaultdict
+import logging
+
 class Model(object):
 
     def __init__(self, policy, ob_space, ac_space, noptions, nenvs, nsteps,
@@ -42,6 +46,7 @@ class Model(object):
             nbatch=nenvs,
             nsteps=1,
             reuse=False)
+
         train_model = policy(
             sess,
             ob_space=ob_space,
@@ -57,6 +62,10 @@ class Model(object):
         # Intra-option policy gradient loss.
         entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
         pg_loss = tf.reduce_mean(Q_U * neglogpac) - entropy*ent_coef
+
+        # Entropy variable for logging purposes.
+        self.entropy = cat_entropy(step_model.opt_pi_logits)
+
         # Intra-option termination gradient loss.
         tg_loss = tf.reduce_mean((A_OHM + deliberation_cost) * logpterm)
         q_loss = tf.reduce_mean(mse(tf.squeeze(train_model.Qopt_vals), Q_U))
@@ -95,10 +104,6 @@ class Model(object):
                 cur_tg_lr = tg_lr.value()
                 cur_q_lr = q_lr.value()
             td_map = {train_model.X:obs, train_model.opt:options, Q_U:Qus, A_OHM:Aohms, A:actions, PG_LR:cur_pg_lr, TG_LR:cur_tg_lr, Q_LR:cur_q_lr}
-            # if states is not None:
-                # td_map[train_model.S] = states
-                # td_map[train_model.M] = masks
-            # TODO: Figure out - loss for option policies, beta, q_opt
             policy_loss, term_loss, q_value_loss, policy_entropy, _, _, _ = sess.run(
                 [pg_loss, tg_loss, q_loss, entropy, _pg_train, _tg_train, _q_train],
                 td_map
@@ -150,11 +155,32 @@ class Runner(object):
         self.opt_eps = self.opt_eps_start
         self.exit_counter = 0
 
+        self.logfile = os.path.join('','{:%Y-%m-%d_%H:%M:%S}.log'.format(datetime.now()))
+        self.logger = logging.getLogger('Environment 0 Episodes')
+        hdlr = logging.FileHandler(self.logfile)
+        formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+        hdlr.setFormatter(formatter)
+        self.logger.addHandler(hdlr)
+        self.logger.setLevel(logging.INFO)
+
+        # Logging variables for env 0.
+        self.episode = 0
+        self.episode_len = 0
+        self.cur_option_len = 0
+        self.episode_reward = 0
+        self.options_selected = []
+        self.option_lens = []
+        self.option_policy_entropies = defaultdict(list)
+        # self.option_q_values = defaultdict(int)
+
+       
+
     def run(self):
         mb_obs, mb_opt_values, mb_options, mb_actions, mb_betas, mb_dones, mb_rewards = [],[],[],[],[],[],[]
         mb_options.append(np.copy(self.opts))
         mb_opt_pi = []
-        # mb_states = self.states
+
+        # Note: n is the step number, i is the environment number.
         for n in range(self.nsteps):
             # get option values
             Qopt = self.model.step_model.Qopt(self.obs)
@@ -167,11 +193,21 @@ class Runner(object):
                         self.opts[i] = np.random.choice(np.arange(self.noptions))
                     else:
                         self.opts[i] = np.argmax(Qopt[i])
+
             actions, betas, opt_dones = self.model.step_model.step(self.obs, self.opts)
+
+            # Logging code below.
+            policy_entropy = self.model.sess.run(
+                self.model.entropy, feed_dict={self.model.step_model.X:self.obs, self.model.step_model.opt:self.opts})[0]
+            self.option_policy_entropies[self.opts[i]].append(policy_entropy)
+            prev_opt_dones = self.opt_dones
+
             self.opt_dones = opt_dones
+            # Append the current step's values over all environments to the minibatches
             mb_obs.append(np.copy(self.obs))
             mb_opt_values.append(Qopt)
-            mb_opt_pi.append(self.model.sess.run(self.model.step_model.opt_pi, feed_dict={self.model.step_model.X:self.obs, self.model.step_model.opt:self.opts}))
+            mb_opt_pi.append(self.model.sess.run(self.model.step_model.opt_pi, 
+                feed_dict={self.model.step_model.X:self.obs, self.model.step_model.opt:self.opts}))
             mb_options.append(np.copy(self.opts))
             mb_actions.append(actions)
             mb_betas.append(betas)
@@ -181,9 +217,46 @@ class Runner(object):
             self.dones = dones
             for i, done in enumerate(dones):
                 if done:
+                    # @saurabh: Why is the observation reset to zeros here if it is overrridden anway below?
                     self.obs[i] = self.obs[i]*0
+                    # If the current episode ended, then the current option terminates by default.
                     self.opt_dones[i] = True
             self.obs = obs
+
+            # Update the logging variables.
+            self.episode_reward += rewards[0]
+            self.episode_len += 1
+            self.cur_option_len += 1
+
+            if self.dones[0]:
+                self.option_lens.append(self.cur_option_len)
+                self.option_lens = self.option_lens[1:]
+                # Log: episode length, episode reward, options selected, option lengths, avg option entropies
+                policy_entropy_per_opt = []
+                for o in self.option_policy_entropies:
+                    avg_entropy = np.mean(np.array(self.option_policy_entropies[o]))
+                    policy_entropy_per_opt.append('Option: {}, Average Entropy: {}'.format(o, avg_entropy))
+
+                log_results(self.logger, self.logfile, self.episode, self.episode_len, 
+                    self.episode_reward, self.options_selected, self.option_lens, policy_entropy_per_opt)
+
+                # The episode length differs from the sum of the option lengths by 1! This is because the first option length is 
+                # 1 when the env moves from state 1 to state 2 -> this counts as 2 in the epiosde length.
+                # print(self.episode_len)
+                # print(np.sum(np.array(self.option_lens)))
+
+                self.cur_option_len = 0
+                self.episode_len = 0
+                self.episode_reward = 0
+                self.episode += 1
+                self.options_selected = []
+                self.option_lens = []
+                self.option_policy_entropies = defaultdict(list)
+            elif prev_opt_dones[0]:
+                self.option_lens.append(self.cur_option_len)
+                self.options_selected.append(self.opts[i])
+                self.cur_option_len = 0
+                
             mb_rewards.append(rewards)
             if self.opt_eps > self.opt_eps_end:
                 self.opt_eps -= (self.opt_eps_start - self.opt_eps_end)/self.opt_eps_steps
@@ -194,7 +267,7 @@ class Runner(object):
         # mb_options -> (nenvs, nsteps+1) -> w_0, w_1, w_2, w_3..., w_nsteps
         # mb_dones -> (nenvs, nsteps+1) -> d_0, d_1, d_0, d_1, d_2..., d_nsteps
         # batch of steps to batch of rollouts
-
+        # Swap the axes from num_steps x num_envs to num_envs x num_steps
         mb_obs = np.asarray(mb_obs, dtype=np.uint8).swapaxes(1, 0).reshape(self.batch_ob_shape)
         mb_opt_values = np.asarray(mb_opt_values, dtype=np.float32).swapaxes(1, 0)
         mb_options = np.asarray(mb_options, dtype=np.int32).swapaxes(1, 0)
@@ -209,9 +282,10 @@ class Runner(object):
         last_values = self.model.step_model.Qopt(self.obs).tolist()
         _, last_betas, _ = self.model.step(self.obs, self.opts)
         last_betas = last_betas.tolist()
+
         mb_Qu = []
         mb_Aohm = []
-        for n, (opt_values, options, betas, dones, rewards, last_value, last_beta) in enumerate(zip(mb_opt_values, mb_options, mb_betas, mb_dones, mb_rewards, last_values, last_betas)):
+        for i, (opt_values, options, betas, dones, rewards, last_value, last_beta) in enumerate(zip(mb_opt_values, mb_options, mb_betas, mb_dones, mb_rewards, last_values, last_betas)):
             rewards = rewards.tolist()
             dones = dones.tolist()
             betas = betas.tolist()
@@ -226,35 +300,39 @@ class Runner(object):
             # reverse the option values
             Qu = []
             Aohm = []
-            for i in range(self.nsteps, 0, -1):
-                q = rewards[i-1] + (1-dones[i])*self.gamma*((1-betas[i])*opt_values[i,options[i-1]] + betas[i]*np.amax(opt_values[i]))
+            for n in range(self.nsteps, 0, -1):
+                q = rewards[n-1] + (1-dones[n])*self.gamma*((1-betas[n])*opt_values[n,options[n-1]] + betas[n]*np.amax(opt_values[n]))
                 Qu.append(q)
-                a = (1 - dones[i-1]) * (opt_values[i-1, options[i-1]] - np.amax(opt_values[i-1]))
+                a = (1 - dones[n-1]) * (opt_values[n-1, options[n-1]] - np.amax(opt_values[n-1]))
                 Aohm.append(a)
 
+            # Reverse the Qus and Aohms since we created them looping from end to start.
             mb_Qu.append(Qu[::-1])
             mb_Aohm.append(Aohm[::-1])
-        # print("option values")
-        # print(mb_opt_values[0])
-        # print("selected options")
-        # print(mb_options[0])
-        # print("option policies")
-        # print(mb_opt_pi[0])
-        # print("selected actions")
-        # print(mb_actions[0])
-        # print("option betas")
-        # print(mb_betas[0])
-        # print("terminations")
-        # print(mb_dones[0][1:])
-        # print("rewards")
-        # print(mb_rewards[0])
-        # print("option value targets")
-        # print(mb_Qu[0])
-        # print("termination advantage")
-        # print(mb_Aohm[0])
+
+        '''
+        print("option values")
+        print(mb_opt_values[0])
+        print("selected options")
+        print(mb_options[0])
+        print("option policies")
+        print(mb_opt_pi[0])
+        print("selected actions")
+        print(mb_actions[0])
+        print("option betas")
+        print(mb_betas[0])
+        print("terminations")
+        print(mb_dones[0][1:])
+        print("rewards")
+        print(mb_rewards[0])
+        print("option value targets")
+        print(mb_Qu[0])
+        print("termination advantage")
+        print(mb_Aohm[0])
         # self.exit_counter += 1
         # if self.exit_counter > 2:
             # exit()
+        '''
 
         mb_Qu = np.asarray(mb_Qu, dtype=np.float32)
         mb_Aohm = np.asarray(mb_Aohm, dtype=np.float32)
@@ -266,6 +344,11 @@ class Runner(object):
         # mb_masks = mb_masks.flatten()
         return mb_obs, mb_options, mb_Qu, mb_Aohm, mb_actions
 
+# TODO: Parameters used in Option-Critic paper:
+# 8 options
+# 0.01 termination regularization
+# 0.01 entropy regularization
+# baseline for the intra-option policy gradients
 def learn(
         policy, env, seed, noptions=1, nsteps=5, total_timesteps=int(80e6),
         vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, lr=7e-4,
@@ -302,6 +385,8 @@ def learn(
         policy_loss, term_loss, q_value_loss, policy_entropy = model.train(obs, options, Qus, Aohms, actions)
         nseconds = time.time()-tstart
         fps = int((update*nbatch)/nseconds)
+        '''
+        # Replaced with custom logging.
         if update % log_interval == 0 or update == 1:
             # ev = explained_variance(values, rewards)
             logger.record_tabular("nupdates", update)
@@ -311,4 +396,26 @@ def learn(
             logger.record_tabular("q_value_loss", float(q_value_loss))
             # logger.record_tabular("explained_variance", float(ev))
             logger.dump_tabular()
+        '''
     env.close()
+
+def log_results(eval_logger, logfile, episode_num, episode_len, episode_reward, options_selected, option_lens, 
+    policy_entropy_per_opt, beta_entropy_per_opt=None, avg_q_val_per_opt=None):
+  """Function that logs the reward statistics obtained by the agent.
+
+  Args:
+    eval_logger: The logger.
+    logfile: File to log reward statistics.
+    episode_num: The number of the episode to log.
+    episode_len: The length of the current episode.
+    episode_reward: The total reward obtained in the current episode.
+    options_selected: Array of options selected.
+    option_lens: Array containing the number of steps each option was run.
+    policy_entropy_per_opt: The entropy of each option's action policy.
+    beta_entropy_per_opt: The entropy of each option;s termination policy.
+    avg_q_val_per_opt: The average q value per option.
+  """
+  eval_logger.info(('Episode : {}, episode length = {}, episode reward = {},'
+    ' options selected = {}, option lengths = {}, policy entropy per option = {}.').format(
+    episode_num, episode_len, episode_reward, options_selected,
+    option_lens, policy_entropy_per_opt))

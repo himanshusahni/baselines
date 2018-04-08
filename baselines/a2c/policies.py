@@ -103,8 +103,10 @@ class CnnPolicy(object):
         nh, nw, nc = ob_space.shape
         ob_shape = (nbatch, nh, nw, nc)
         nact = ac_space.n
+
         X = tf.placeholder(tf.uint8, ob_shape) #obs
         opt = tf.placeholder(tf.int32, [nbatch])
+
         with tf.variable_scope("model", reuse=reuse):
             h = nature_cnn(X)
 
@@ -119,6 +121,7 @@ class CnnPolicy(object):
             intra_pi_logits = tf.reshape(fc(h, 'pi', nact*noptions, init_scale=0.01), (nbatch, noptions, nact))
 
             opt_pi_logits = tf.gather(tf.reshape(intra_pi_logits, (nbatch*noptions, nact)), gather_indices, axis=0)
+        
             # option termination
             betas = fc(h, 'b', noptions, init_scale=0.01)
             beta_logits = tf.gather(tf.reshape(betas, [-1]), gather_indices, axis=0)
@@ -131,6 +134,7 @@ class CnnPolicy(object):
         # sample termination of options
         beta0 = tf.sigmoid(beta_logits)
         self.bpd = tf.distributions.Bernoulli(probs=beta0)
+        # Does this thing below work properly?
         opt_done0 = self.bpd.sample()
         neglogpbeta0 = -self.bpd.log_prob(opt_done0)
 
