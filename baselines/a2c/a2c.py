@@ -27,6 +27,7 @@ class Model(object):
             ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, lr=7e-4,
             alpha=0.99, epsilon=1e-5, deliberation_cost=0.01, total_timesteps=int(80e6), lrschedule='linear'):
 
+        self.saver = None
         sess = tf_util.make_session()
         nact = ac_space.n
         nbatch = nenvs*nsteps
@@ -122,11 +123,21 @@ class Model(object):
                 restores.append(p.assign(loaded_p))
             ps = sess.run(restores)
 
+        def set_saver(saver, checkpoint_path='checkpoints/'):
+            self.saver = saver
+            self.checkpoint_path = checkpoint_path
+
+        def save_weights(global_step):
+            if self.saver is not None:
+                self.saver.save(sess, self.checkpoint_path, global_step=global_step)
+
         self.train = train
         self.train_model = train_model
         self.step_model = step_model
         self.step = step_model.step
         self.save = save
+        self.save_weights = save_weights
+        self.set_saver = set_saver
         self.load = load
         self.sess = sess
         tf.global_variables_initializer().run(session=sess)
@@ -196,10 +207,11 @@ class Runner(object):
 
             actions, betas, opt_dones = self.model.step_model.step(self.obs, self.opts)
 
-            # Logging code below.
+            # Compute entropy of option policy for logging purposes.
             policy_entropy = self.model.sess.run(
                 self.model.entropy, feed_dict={self.model.step_model.X:self.obs, self.model.step_model.opt:self.opts})[0]
             self.option_policy_entropies[self.opts[i]].append(policy_entropy)
+            # Set prev_opt_dones equal to self.opt_dones prior to resetting the opt_dones to the new ones for logging purposes.
             prev_opt_dones = self.opt_dones
 
             self.opt_dones = opt_dones
@@ -360,23 +372,29 @@ def learn(
     nenvs = env.num_envs
     ob_space = env.observation_space
     ac_space = env.action_space
-    model = Model(
-        policy=policy,
-        ob_space=ob_space,
-        ac_space=ac_space,
-        noptions=noptions,
-        nenvs=nenvs,
-        nsteps=nsteps,
-        ent_coef=ent_coef,
-        vf_coef=vf_coef,
-        max_grad_norm=max_grad_norm,
-        lr=lr,
-        alpha=alpha,
-        epsilon=epsilon,
-        total_timesteps=total_timesteps,
-        lrschedule=lrschedule)
+
+    with tf.device("/cpu:0"):
+
+        model = Model(
+            policy=policy,
+            ob_space=ob_space,
+            ac_space=ac_space,
+            noptions=noptions,
+            nenvs=nenvs,
+            nsteps=nsteps,
+            ent_coef=ent_coef,
+            vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
+            lr=lr,
+            alpha=alpha,
+            epsilon=epsilon,
+            total_timesteps=total_timesteps,
+            lrschedule=lrschedule)
+
+        saver = tf.train.Saver(keep_checkpoint_every_n_hours=0.5, max_to_keep=2)
 
     runner = Runner(env, model, noptions=noptions, nsteps=nsteps, gamma=gamma)
+    model.set_saver(saver)
 
     nbatch = nenvs*nsteps
     tstart = time.time()
@@ -397,6 +415,8 @@ def learn(
             # logger.record_tabular("explained_variance", float(ev))
             logger.dump_tabular()
         '''
+        if update % log_interval == 0 or update == 1:
+            model.save_weights(update)
     env.close()
 
 def log_results(eval_logger, logfile, episode_num, episode_len, episode_reward, options_selected, option_lens, 
