@@ -34,6 +34,7 @@ class Model(object):
 
         A = tf.placeholder(tf.int32, [nbatch])        # Actions
         Q_U = tf.placeholder(tf.float32, [nbatch])    # Q_U(s,w,a) values
+        Q_OHM = tf.placeholder(tf.float32, [nbatch])  # Q_OHM(s, w) values - used as baseline for variance reduction
         A_OHM = tf.placeholder(tf.float32, [nbatch])  # Advantages for beta updates
         PG_LR = tf.placeholder(tf.float32, [])        # Policy Learning Rates
         TG_LR = tf.placeholder(tf.float32, [])        # Termination Learning Rates
@@ -62,7 +63,7 @@ class Model(object):
 
         # Intra-option policy gradient loss.
         entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
-        pg_loss = tf.reduce_mean(Q_U * neglogpac) - entropy*ent_coef
+        pg_loss = tf.reduce_mean((Q_U - Q_OHM) * neglogpac) - entropy*ent_coef
 
         # Entropy variable for logging purposes.
         self.entropy = cat_entropy(step_model.opt_pi_logits)
@@ -99,12 +100,12 @@ class Model(object):
         tg_lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
         q_lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
 
-        def train(obs, options, Qus, Aohms, actions):
+        def train(obs, options, Qus, Qohms, Aohms, actions):
             for step in range(len(obs)):
                 cur_pg_lr = pg_lr.value()
                 cur_tg_lr = tg_lr.value()
                 cur_q_lr = q_lr.value()
-            td_map = {train_model.X:obs, train_model.opt:options, Q_U:Qus, A_OHM:Aohms, A:actions, PG_LR:cur_pg_lr, TG_LR:cur_tg_lr, Q_LR:cur_q_lr}
+            td_map = {train_model.X:obs, train_model.opt:options, Q_U:Qus, Q_OHM:Qohms, A_OHM:Aohms, A:actions, PG_LR:cur_pg_lr, TG_LR:cur_tg_lr, Q_LR:cur_q_lr}
             policy_loss, term_loss, q_value_loss, policy_entropy, _, _, _ = sess.run(
                 [pg_loss, tg_loss, q_loss, entropy, _pg_train, _tg_train, _q_train],
                 td_map
@@ -297,6 +298,7 @@ class Runner(object):
 
         mb_Qu = []
         mb_Aohm = []
+        mb_Qohm = []
         for i, (opt_values, options, betas, dones, rewards, last_value, last_beta) in enumerate(zip(mb_opt_values, mb_options, mb_betas, mb_dones, mb_rewards, last_values, last_betas)):
             rewards = rewards.tolist()
             dones = dones.tolist()
@@ -310,6 +312,7 @@ class Runner(object):
             # dones -> (nsteps+1,) -> d_0, d_1, ..., d_nsteps
             # options -> (nsteps,) -> w_0, w_1, ..., w_nsteps
             # reverse the option values
+            Qohm = []
             Qu = []
             Aohm = []
             for n in range(self.nsteps, 0, -1):
@@ -317,10 +320,12 @@ class Runner(object):
                 Qu.append(q)
                 a = (1 - dones[n-1]) * (opt_values[n-1, options[n-1]] - np.amax(opt_values[n-1]))
                 Aohm.append(a)
+                Qohm.append(opt_values[n-1,options[n-1]])
 
-            # Reverse the Qus and Aohms since we created them looping from end to start.
+            # Reverse the Qus, Qohms, and Aohms since we created them looping from end to start.
             mb_Qu.append(Qu[::-1])
             mb_Aohm.append(Aohm[::-1])
+            mb_Qohm.append(Qohm[::-1])
 
         '''
         print("option values")
@@ -347,6 +352,7 @@ class Runner(object):
         '''
 
         mb_Qu = np.asarray(mb_Qu, dtype=np.float32)
+        mb_Qohm = np.asarray(mb_Qohm, dtype=np.float32)
         mb_Aohm = np.asarray(mb_Aohm, dtype=np.float32)
         mb_options = mb_options[:,1:].flatten()
         mb_Qu = mb_Qu.flatten()
@@ -354,7 +360,7 @@ class Runner(object):
         mb_actions = mb_actions.flatten()
         # mb_betas = mb_betas.flatten()
         # mb_masks = mb_masks.flatten()
-        return mb_obs, mb_options, mb_Qu, mb_Aohm, mb_actions
+        return mb_obs, mb_options, mb_Qu, mb_Qohm, mb_Aohm, mb_actions
 
 # TODO: Parameters used in Option-Critic paper:
 # 8 options
@@ -399,8 +405,8 @@ def learn(
     nbatch = nenvs*nsteps
     tstart = time.time()
     for update in range(1, total_timesteps//nbatch+1):
-        obs, options, Qus, Aohms, actions = runner.run()
-        policy_loss, term_loss, q_value_loss, policy_entropy = model.train(obs, options, Qus, Aohms, actions)
+        obs, options, Qus, Qohms, Aohms, actions = runner.run()
+        policy_loss, term_loss, q_value_loss, policy_entropy = model.train(obs, options, Qus, Qohms, Aohms, actions)
         nseconds = time.time()-tstart
         fps = int((update*nbatch)/nseconds)
         '''

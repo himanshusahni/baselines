@@ -23,6 +23,10 @@ def main():
     parser.add_argument('--lrschedule', help='Learning rate schedule', choices=['constant', 'linear'], default='constant')
     args = parser.parse_args()
     logger.configure()
+    print(args.env)
+    print(args.num_timesteps)
+    print(args.policy)
+    print(args.lrschedule)
     train(args.env, num_timesteps=args.num_timesteps, seed=args.seed,
         policy=args.policy, lrschedule=args.lrschedule, num_env=16)
 
