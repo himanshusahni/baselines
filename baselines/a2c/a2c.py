@@ -25,7 +25,7 @@ class Model(object):
 
     def __init__(self, policy, ob_space, ac_space, noptions, nenvs, nsteps,
             ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, lr=7e-4,
-            alpha=0.99, epsilon=1e-5, deliberation_cost=0.01, total_timesteps=int(80e6), lrschedule='linear'):
+            alpha=0.99, epsilon=1e-5, deliberation_cost=0.01, total_timesteps=int(80e6), lrschedule='linear', baseline=True):
 
         self.saver = None
         sess = tf_util.make_session()
@@ -36,9 +36,9 @@ class Model(object):
         Q_U = tf.placeholder(tf.float32, [nbatch])    # Q_U(s,w,a) values
         Q_OHM = tf.placeholder(tf.float32, [nbatch])  # Q_OHM(s, w) values - used as baseline for variance reduction
         A_OHM = tf.placeholder(tf.float32, [nbatch])  # Advantages for beta updates
-        PG_LR = tf.placeholder(tf.float32, [])        # Policy Learning Rates
-        TG_LR = tf.placeholder(tf.float32, [])        # Termination Learning Rates
-        Q_LR = tf.placeholder(tf.float32, [])         # Option-value Learning Rates
+        PG_LR = tf.placeholder(tf.float32, [])        # Intra-Option Policy Learning Rates
+        TG_LR = tf.placeholder(tf.float32, [])        # Termination Policy  Learning Rates
+        Q_LR = tf.placeholder(tf.float32, [])         # Option-Value Crtic Learning Rates
 
         step_model = policy(
             sess,
@@ -58,12 +58,19 @@ class Model(object):
             nsteps=nsteps,
             reuse=True)
 
+        # TODO: Check to make sure this is negative.
         neglogpac = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=train_model.opt_pi_logits, labels=A)
+        # TODO: Check to make sure this is positive.
         logpterm = tf.sigmoid(train_model.beta_logits)
 
-        # Intra-option policy gradient loss.
         entropy = tf.reduce_mean(cat_entropy(train_model.opt_pi_logits))
-        pg_loss = tf.reduce_mean((Q_U - Q_OHM) * neglogpac) - entropy*ent_coef
+        
+        pg_multiplier = Q_U
+        if baseline:
+            pg_multiplier -= Q_OHM
+
+        # Intra-option policy gradient loss.
+        pg_loss = tf.reduce_mean(pg_multiplier * neglogpac) - entropy*ent_coef
 
         # Entropy variable for logging purposes.
         self.entropy = cat_entropy(step_model.opt_pi_logits)
@@ -101,6 +108,21 @@ class Model(object):
         q_lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
 
         def train(obs, options, Qus, Qohms, Aohms, actions):
+            '''
+            print("Observation shape:")
+            print(np.shape(obs))
+            print("Options shape:")
+            print(np.shape(options))
+            print("Qus shape:")
+            print(np.shape(Qus))
+            print("Qohms shape:")
+            print(np.shape(Qohms))
+            print("Aohms shape:")
+            print(np.shape(Aohms))
+            print("Actions shape:")
+            print(np.shape(actions))
+            '''
+
             for step in range(len(obs)):
                 cur_pg_lr = pg_lr.value()
                 cur_tg_lr = tg_lr.value()
@@ -155,18 +177,25 @@ class Runner(object):
         self.obs = np.zeros((nenv, nh, nw, nc), dtype=np.uint8)
         self.nc = nc
         obs = env.reset()
-        self.gamma = gamma
         self.nsteps = nsteps
+        self.gamma = gamma
         # self.states = model.initial_state
+       
+       ##########################################
+        # Vars below are for the current step in each environment.
         self.dones = [True for _ in range(nenv)]
         self.opts = [0 for _ in range(nenv)]
         self.opt_dones = [1 for _ in range(nenv)]
+        ##########################################
+
         self.opt_eps_start = 1.0
         self.opt_eps_end = 0.05
         self.opt_eps_steps = 1000000
+        # Current epsilon for the e-greedy option policy.
         self.opt_eps = self.opt_eps_start
         self.exit_counter = 0
 
+        # Logging.
         self.logfile = os.path.join('','{:%Y-%m-%d_%H:%M:%S}.log'.format(datetime.now()))
         self.logger = logging.getLogger('Environment 0 Episodes')
         hdlr = logging.FileHandler(self.logfile)
@@ -184,8 +213,6 @@ class Runner(object):
         self.option_lens = []
         self.option_policy_entropies = defaultdict(list)
         # self.option_q_values = defaultdict(int)
-
-       
 
     def run(self):
         mb_obs, mb_opt_values, mb_options, mb_actions, mb_betas, mb_dones, mb_rewards = [],[],[],[],[],[],[]
@@ -208,10 +235,10 @@ class Runner(object):
 
             actions, betas, opt_dones = self.model.step_model.step(self.obs, self.opts)
 
-            # Compute entropy of option policy for logging purposes.
+            # Compute entropy of option policy for environment 0 for logging purposes.
             policy_entropy = self.model.sess.run(
                 self.model.entropy, feed_dict={self.model.step_model.X:self.obs, self.model.step_model.opt:self.opts})[0]
-            self.option_policy_entropies[self.opts[i]].append(policy_entropy)
+            self.option_policy_entropies[self.opts[0]].append(policy_entropy)
             # Set prev_opt_dones equal to self.opt_dones prior to resetting the opt_dones to the new ones for logging purposes.
             prev_opt_dones = self.opt_dones
 
@@ -307,6 +334,13 @@ class Runner(object):
             # # last option value is bootstrapped
             betas += [last_beta]
             opt_values = np.concatenate((opt_values, np.expand_dims(last_value, axis=0)), axis=0)
+            
+            print('Shapes of everything.')
+            print("Q opts: {}".format(np.shape(np.array(opt_values))))
+            print("Betas: {}".format(np.shape(np.array(betas))))
+            print("Selected options: {}".format(np.shape(np.array(options))))
+            print("Dones: {}".format(np.shape(np.array(dones))))
+            print()
             # betas -> (nsteps+1,) -> b1, b2, ..., b_nsteps, b_nsteps+1
             # opt_values -> (nsteps+1, noptions) -> Q_1, Q_2, ..., Q_nsteps, Q_nsteps+1
             # dones -> (nsteps+1,) -> d_0, d_1, ..., d_nsteps
@@ -326,6 +360,16 @@ class Runner(object):
             mb_Qu.append(Qu[::-1])
             mb_Aohm.append(Aohm[::-1])
             mb_Qohm.append(Qohm[::-1])
+
+            print("Rewards: {}".format(rewards))
+            print("Dones: {}".format(dones))
+            print("Betas: {}".format(betas))
+            print("Option values: {}".format(opt_values))
+            print("Selected Options: {}".format(options))
+            print("Qu: {}".format(Qu[::-1]))
+            print("Aohm: {}".format(Aohm[::-1]))
+            print("Qohm: {}".format(Qohm[::-1]))
+            exit()
 
         '''
         print("option values")
@@ -357,6 +401,7 @@ class Runner(object):
         mb_options = mb_options[:,1:].flatten()
         mb_Qu = mb_Qu.flatten()
         mb_Aohm = mb_Aohm.flatten()
+        mb_Qohm = mb_Qohm.flatten()
         mb_actions = mb_actions.flatten()
         # mb_betas = mb_betas.flatten()
         # mb_masks = mb_masks.flatten()

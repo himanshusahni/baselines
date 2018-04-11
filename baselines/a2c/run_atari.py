@@ -17,6 +17,7 @@ def train(env_id, num_timesteps, seed, policy, lrschedule, num_env):
     learn(policy_fn, env, seed, noptions=4, total_timesteps=int(num_timesteps * 1.1), lrschedule=lrschedule)
     env.close()
 
+# Environments used in Option-Critic paper: Asterisk, Ms. Pacman, Seaquest, Zaxxon
 def main():
     parser = atari_arg_parser()
     parser.add_argument('--policy', help='Policy architecture', choices=['cnn', 'lstm', 'lnlstm'], default='cnn')
